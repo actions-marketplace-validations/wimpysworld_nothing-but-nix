@@ -20,6 +20,10 @@ inputs:
     description: 'Space in MB to mercifully spare on the /mnt filesystem (default: 1024)'
     required: false
     default: '1024'
+  nix-permission-edict:
+    description: 'Grant user ownership of /nix directory (default: false). Useful for Nix installers that require user-writable /nix.'
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -27,13 +31,23 @@ runs:
       id: environment-check
       shell: bash
       run: |
-        if [ "$(lsb_release -is)" != "Ubuntu" ]; then
-          echo "is_supported=false" >> $GITHUB_OUTPUT
-          echo "This action only works on Ubuntu runners"
-        elif [ -z "$GITHUB_ACTIONS" ]; then
+        if [[ "${{ runner.os }}" == "Linux" ]]; then
+          if [ "$(lsb_release -is)" != "Ubuntu" ]; then
+            echo "is_supported=false" >> $GITHUB_OUTPUT
+            echo "This action only works on Ubuntu runners"
+            exit 1
+          else
+            echo "is_supported=true" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+        if [ -z "$GITHUB_ACTIONS" ]; then
           echo "is_supported=false" >> $GITHUB_OUTPUT
           echo "This action only works on GitHub Actions runner"
-        elif [ -d /nix ]; then
+          exit 1
+        fi
+
+        if [ -d /nix ]; then
           echo "is_supported=false" >> $GITHUB_OUTPUT
           echo "This action must be run before Nix is installed"
           exit 1
@@ -47,7 +61,7 @@ runs:
       run: |
         input_protocol="${{ inputs.hatchet-protocol }}"
         # Convert to lowercase for case-insensitive comparison
-        input_protocol="${input_protocol,,}"
+        input_protocol="$(tr '[:upper:]' '[:lower:]' <<< "$input_protocol")"
         
         case "$input_protocol" in
           "holster")
@@ -119,6 +133,17 @@ runs:
         sudo mkdir -p /nix
         sudo mount LABEL=nix /nix -o noatime,nobarrier,nodiscard,compress=zstd:1,space_cache=v2,commit=120
         sudo df -h
+
+        if [[ "${{ inputs.nix-permission-edict }}" == "true" ]]; then
+          echo "Applying Nix Permission Edict: Granting user ownership of /nix"
+          sudo chown -R "$(id --user)":"$(id --group)" /nix
+        fi
+
+        # Create a tmp directory within /mnt for Nix builds and set TMPDIR
+        TMPNIX="$(sudo mktemp --directory --tmpdir=/mnt)"
+        sudo chmod 1777 "${TMPNIX}"
+        echo "TMPDIR=${TMPNIX}" >> $GITHUB_ENV
+        echo "TMPDIR set to ${TMPNIX} to use space on the /mnt volume for builds."
 
         # Create a directory to store expansion state
         mkdir -p "${HOME}/.expansion"
@@ -329,11 +354,12 @@ runs:
           echo "📈 Background space expansion started. /nix will grow as space becomes available."
         fi
     - name: The Post
+      if: ${{ runner.os }} == 'Linux'
       uses: srz-zumix/post-run-action@v2
       with:
         shell: bash -e {0}
         post-run: |
-          ls -ltr ${HOME}/.expansion/*_done
+          ls -ltr ${HOME}/.expansion/*_done || true
           all_disks=()
   
           # Check for disks in /mnt directory
@@ -352,4 +378,12 @@ runs:
           for disk in "${all_disks[@]}"; do
             echo "- $disk ($(du -h "$disk" | cut -f1))"
           done
+          echo "Space used by TMPDIR:"
+          sudo du -csh "$TMPDIR" || true
+          echo "Space used by disk images:"
           sudo df -h
+          echo "Check which device(s) btrfs is using:"
+          sudo btrfs filesystem show /nix
+          echo "See actual allocation per device:"
+          sudo btrfs device stats /nix
+          
